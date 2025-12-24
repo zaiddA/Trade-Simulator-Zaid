@@ -55,7 +55,7 @@ cd vcpkg
 ## Build
 
 ```bash
-cd GoQuant/Test
+cd Test
 mkdir build && cd build
 cmake .. -DCMAKE_TOOLCHAIN_FILE=C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake -DCMAKE_BUILD_TYPE=Release
 cmake --build . --config Release
@@ -171,4 +171,5 @@ This project was developed by Zaid (B.Tech, IIIT Pune)
 ---
 
 *Note: The simulator is ready for demo with working models and real-time data connection.* 
+
 
