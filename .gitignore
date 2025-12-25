@@ -1,2 +1,5 @@
+Test/build/
 Test/build-macos/
-Test/build-macos/
+.DS_Store
+*.log
+.env

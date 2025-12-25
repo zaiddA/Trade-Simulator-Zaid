@@ -18,7 +18,9 @@
 #include <string>
 #include <mutex>
 #include <limits>
+#include <cstdlib>
 #include <filesystem>
+#include <sstream>
 
 #include "OrderBook.h"
 
@@ -71,6 +73,41 @@ static std::ifstream open_model_file(const std::string& filename, const std::str
         }
     }
     return std::ifstream{};
+}
+
+static void set_env_var(const std::string& k, const std::string& v)
+{
+#ifdef _WIN32
+    _putenv_s(k.c_str(), v.c_str());
+#else
+    setenv(k.c_str(), v.c_str(), 1);
+#endif
+}
+
+// Load simple KEY=VALUE pairs from a .env-style file
+static void load_env_file(const std::filesystem::path& baseDir)
+{
+    std::vector<std::filesystem::path> candidates = {
+        baseDir / ".env",
+        baseDir.parent_path() / ".env"};
+    for (const auto& p : candidates)
+    {
+        std::error_code ec;
+        if (!std::filesystem::exists(p, ec)) continue;
+        std::ifstream in(p.string());
+        if (!in) continue;
+        std::string line;
+        while (std::getline(in, line))
+        {
+            if (line.empty() || line[0] == '#') continue;
+            auto pos = line.find('=');
+            if (pos == std::string::npos) continue;
+            std::string key = line.substr(0, pos);
+            std::string val = line.substr(pos + 1);
+            if (!key.empty() && !val.empty()) set_env_var(key, val);
+        }
+        break; // use first found
+    }
 }
 
 // Command-line usage help
@@ -147,11 +184,14 @@ int main(int argc, char *argv[])
                  symbol, notionalUsd, takerBps, dailyVolUsd, warmupSec, intervalSec, sigma * 100.0, lambda);
 
     std::string exeDir = std::filesystem::canonical(std::filesystem::path(argv[0])).parent_path().string();
+    load_env_file(exeDir);
 
     ix::initNetSystem();
 
     // Web UI stream server to broadcast ticks
-    ix::WebSocketServer streamServer(9002, "0.0.0.0");
+    int port = 9002;
+    if (const char* p = std::getenv("PORT")) port = std::atoi(p);
+    ix::WebSocketServer streamServer(port, "0.0.0.0");
     json configMsg = {
         {"type", "config"},
         {"data",
@@ -210,7 +250,7 @@ int main(int argc, char *argv[])
             }
         }
     };
-    spdlog::info("UI stream server listening on ws://localhost:9002/stream");
+    spdlog::info("UI stream server listening on ws://localhost:{}/stream", port);
 
     double intercept = 0.0, w_spread = 0.0, w_depth = 0.0;
     {

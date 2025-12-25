@@ -1,0 +1,27 @@
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    build-essential cmake pkg-config git curl zip unzip libssl-dev ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt
+RUN git clone https://github.com/microsoft/vcpkg.git
+WORKDIR /opt/vcpkg
+RUN ./bootstrap-vcpkg.sh
+RUN ./vcpkg install "ixwebsocket[ssl]" spdlog nlohmann-json openssl catch2 benchmark
+
+ENV VCPKG_ROOT=/opt/vcpkg
+WORKDIR /app
+COPY Test /app/Test
+
+RUN rm -rf /app/Test/build /app/Test/build-macos
+
+RUN cmake -S /app/Test -B /app/Test/build \
+      -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
+      -DCMAKE_BUILD_TYPE=Release \
+ && cmake --build /app/Test/build --config Release
+
+WORKDIR /app/Test/build
+ENV PORT=9002
+EXPOSE 9002
+CMD ["./simulator", "--symbol", "BTC-USDT", "--notional", "1000", "--fee", "10", "--delay", "5", "--interval", "5"]
