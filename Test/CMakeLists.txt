@@ -39,8 +39,6 @@ add_executable(simulator
 target_link_libraries(simulator
     PRIVATE
       simulator_lib
-      bcrypt
-      Ws2_32
 )
 
 enable_testing()

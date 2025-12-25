@@ -1,0 +1,7 @@
+{
+  "intercept": 0.0,
+  "weights": {
+    "spread": 1.0,
+    "depth_top5": -0.5
+  }
+}

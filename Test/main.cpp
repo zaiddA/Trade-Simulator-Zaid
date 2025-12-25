@@ -18,6 +18,7 @@
 #include <string>
 #include <mutex>
 #include <limits>
+#include <filesystem>
 
 #include "OrderBook.h"
 
@@ -49,6 +50,27 @@ double almgrenChrissImpact(double Q, double V, double sigma, double lambda)
     double perm = kappa * sigma / V * Q * Q;
     double risk = lambda * sigma * sigma * Q * Q;
     return perm + risk;
+}
+
+// Try to open a model file from multiple candidate locations
+static std::ifstream open_model_file(const std::string& filename, const std::string& exeDir)
+{
+    std::vector<std::filesystem::path> candidates = {
+        std::filesystem::path(filename),
+        std::filesystem::path(exeDir) / filename,
+        std::filesystem::path(exeDir).parent_path() / filename,
+        std::filesystem::path(exeDir).parent_path().parent_path() / filename};
+
+    for (const auto& p : candidates)
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(p, ec))
+        {
+            std::ifstream in(p.string());
+            if (in) return in;
+        }
+    }
+    return std::ifstream{};
 }
 
 // Command-line usage help
@@ -121,8 +143,10 @@ int main(int argc, char *argv[])
         else { std::cerr << "Unknown option: " << a << "\n"; print_help(); return 1; }
     }
 
-    spdlog::info("Params ▶ symbol={}, notional=${:.2f}, fee={}bps, vol=${:.0f}, delay={}s, interval={}s, sigma={:.3%}, lambda={:.1e}",
-                 symbol, notionalUsd, takerBps, dailyVolUsd, warmupSec, intervalSec, sigma, lambda);
+    spdlog::info("Params ▶ symbol={}, notional=${:.2f}, fee={}bps, vol=${:.0f}, delay={}s, interval={}s, sigma={:.3f}%, lambda={:.1e}",
+                 symbol, notionalUsd, takerBps, dailyVolUsd, warmupSec, intervalSec, sigma * 100.0, lambda);
+
+    std::string exeDir = std::filesystem::canonical(std::filesystem::path(argv[0])).parent_path().string();
 
     ix::initNetSystem();
 
@@ -176,28 +200,91 @@ int main(int argc, char *argv[])
         return 1;
     }
     streamServer.start();
+    auto broadcastTick = [&streamServer](const json& payload) {
+        auto clients = streamServer.getClients();
+        for (auto& client : clients)
+        {
+            if (client)
+            {
+                client->send(payload.dump());
+            }
+        }
+    };
     spdlog::info("UI stream server listening on ws://localhost:9002/stream");
 
     double intercept = 0.0, w_spread = 0.0, w_depth = 0.0;
     {
-        std::ifstream in("slippage_model.json");
-        if (!in) spdlog::warn("Could not open slippage_model.json; model slippage disabled");
-        else {
-            json m;
-            in >> m;
-            intercept = m.value("intercept", 0.0);
-            w_spread = m["weights"].value("spread", 0.0);
-            w_depth = m["weights"].value("depth_top5", 0.0);
-            spdlog::info("Loaded slippage model ▶ intercept={:.3e}, spread_w={:.3e}, depth_w={:.3e}", intercept, w_spread, w_depth);
+        auto in = open_model_file("slippage_model.json", exeDir);
+        if (!in)
+        {
+            spdlog::info("Slippage model not found; using default zero weights.");
+        }
+        else
+        {
+            if (in.peek() == std::ifstream::traits_type::eof())
+            {
+                spdlog::warn("Slippage model file is empty; using defaults.");
+            }
+            else
+            {
+                try
+                {
+                    json m;
+                    in >> m;
+                    intercept = m.value("intercept", 0.0);
+                    w_spread = m["weights"].value("spread", 0.0);
+                    w_depth = m["weights"].value("depth_top5", 0.0);
+                    spdlog::info("Loaded slippage model ▶ intercept={:.3e}, spread_w={:.3e}, depth_w={:.3e}", intercept, w_spread, w_depth);
+                }
+                catch (const std::exception& e)
+                {
+                    spdlog::warn("Failed to parse slippage_model.json; using defaults. {}", e.what());
+                }
+            }
         }
     }
 
     MakerTakerModel mt_model;
-    if (!mt_model.load("maker_taker_model.json"))
-        spdlog::warn("Maker/taker model not found; classification disabled.");
-    else
-        spdlog::info("Loaded maker/taker model ▶ intercept={:.3e}, spread_w={:.3e}, depth_w={:.3e}",
-                     mt_model.intercept, mt_model.w_spread, mt_model.w_depth);
+    {
+        auto in = open_model_file("maker_taker_model.json", exeDir);
+        if (!in)
+        {
+            spdlog::info("Maker/taker model not found; using neutral defaults (50/50).");
+            mt_model.intercept = 0.0;
+            mt_model.w_spread = 0.0;
+            mt_model.w_depth = 0.0;
+        }
+        else
+        {
+            if (in.peek() == std::ifstream::traits_type::eof())
+            {
+                spdlog::warn("Maker/taker model file is empty; using defaults.");
+                mt_model.intercept = 0.0;
+                mt_model.w_spread = 0.0;
+                mt_model.w_depth = 0.0;
+            }
+            else
+            {
+                try
+                {
+                    json j;
+                    in >> j;
+                    mt_model.intercept = j["intercept"];
+                    mt_model.w_spread = j["weights"]["spread"];
+                    mt_model.w_depth = j["weights"]["depth_top5"];
+                    spdlog::info("Loaded maker/taker model ▶ intercept={:.3e}, spread_w={:.3e}, depth_w={:.3e}",
+                                 mt_model.intercept, mt_model.w_spread, mt_model.w_depth);
+                }
+                catch (const std::exception& e)
+                {
+                    spdlog::warn("Failed to parse maker_taker_model.json; using defaults. {}", e.what());
+                    mt_model.intercept = 0.0;
+                    mt_model.w_spread = 0.0;
+                    mt_model.w_depth = 0.0;
+                }
+            }
+        }
+    }
 
     ix::WebSocket ws;
     OrderBook book;
@@ -299,7 +386,7 @@ int main(int argc, char *argv[])
                 {"drops_in_window", dropsInWindow},
                 {"imbalance", imbalance}};
             if (tickLatencyMs >= 0.0) tick["tick_latency_ms"] = tickLatencyMs;
-            streamServer.broadcast(tick.dump());
+            broadcastTick(tick);
         } else {
             double slip_vwap = (vwap - mid) / mid * 100.0;
             double slip_mod_pct = intercept + w_spread * spread + w_depth * depth5;
@@ -341,7 +428,7 @@ int main(int argc, char *argv[])
                 {"imbalance", imbalance}};
             if (!std::isnan(takerProb)) tick["taker_prob_pct"] = takerProb * 100.0;
             if (tickLatencyMs >= 0.0) tick["tick_latency_ms"] = tickLatencyMs;
-            streamServer.broadcast(tick.dump());
+            broadcastTick(tick);
         }
 
         auto t1 = std::chrono::steady_clock::now();
