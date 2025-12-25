@@ -16,11 +16,14 @@
 #include <chrono>
 #include <cmath>
 #include <string>
+#include <mutex>
+#include <limits>
 
 #include "OrderBook.h"
 
 #include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocket.h>
+#include <ixwebsocket/IXWebSocketServer.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -28,7 +31,16 @@ using json = nlohmann::json;
 
 // Graceful shutdown flag
 static std::atomic<bool> keepRunning{true};
+static std::atomic<int64_t> lastOkxTsMs{0};
+static std::atomic<int64_t> lastOkxRecvMs{0};
 static void handle_signal(int) { keepRunning = false; }
+
+static int64_t nowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 // Almgren–Chriss impact model
 double almgrenChrissImpact(double Q, double V, double sigma, double lambda)
@@ -112,6 +124,60 @@ int main(int argc, char *argv[])
     spdlog::info("Params ▶ symbol={}, notional=${:.2f}, fee={}bps, vol=${:.0f}, delay={}s, interval={}s, sigma={:.3%}, lambda={:.1e}",
                  symbol, notionalUsd, takerBps, dailyVolUsd, warmupSec, intervalSec, sigma, lambda);
 
+    ix::initNetSystem();
+
+    // Web UI stream server to broadcast ticks
+    ix::WebSocketServer streamServer(9002, "0.0.0.0");
+    json configMsg = {
+        {"type", "config"},
+        {"data",
+             {{"symbol", symbol},
+              {"notional", notionalUsd},
+              {"taker_bps", takerBps},
+              {"daily_vol_usd", dailyVolUsd},
+              {"sigma", sigma},
+              {"lambda", lambda},
+              {"interval_sec", intervalSec},
+              {"warmup_sec", warmupSec}}}};
+
+    streamServer.setOnClientMessageCallback(
+        [configMsg](std::shared_ptr<ix::ConnectionState> connectionState,
+                    ix::WebSocket &ws,
+                    const ix::WebSocketMessagePtr &msg) {
+            using namespace ix;
+            if (msg->type == WebSocketMessageType::Open)
+            {
+                spdlog::info("UI client connected: {}", connectionState->getId());
+                ws.send(configMsg.dump());
+            }
+            else if (msg->type == WebSocketMessageType::Close)
+            {
+                spdlog::info("UI client disconnected: {}", connectionState->getId());
+            }
+            else if (msg->type == WebSocketMessageType::Message)
+            {
+                // Respond to ping or ignore other messages for now
+                auto j = json::parse(msg->str, nullptr, false);
+                if (j.is_object() && j.value("type", "") == "ping")
+                {
+                    ws.send(R"({"type":"pong"})");
+                }
+            }
+            else if (msg->type == WebSocketMessageType::Error)
+            {
+                spdlog::warn("UI client error: {}", msg->errorInfo.reason);
+            }
+        });
+
+    auto listenRes = streamServer.listen();
+    if (!listenRes.first)
+    {
+        spdlog::error("Failed to start UI stream server on 9002: {}", listenRes.second);
+        return 1;
+    }
+    streamServer.start();
+    spdlog::info("UI stream server listening on ws://localhost:9002/stream");
+
     double intercept = 0.0, w_spread = 0.0, w_depth = 0.0;
     {
         std::ifstream in("slippage_model.json");
@@ -133,7 +199,6 @@ int main(int argc, char *argv[])
         spdlog::info("Loaded maker/taker model ▶ intercept={:.3e}, spread_w={:.3e}, depth_w={:.3e}",
                      mt_model.intercept, mt_model.w_spread, mt_model.w_depth);
 
-    ix::initNetSystem();
     ix::WebSocket ws;
     OrderBook book;
     spdlog::set_level(spdlog::level::info);
@@ -152,6 +217,20 @@ int main(int argc, char *argv[])
                 auto j = json::parse(msg->str);
                 if (j.contains("data")) {
                     for (auto &e : j["data"]) {
+                        if (e.contains("ts"))
+                        {
+                            try
+                            {
+                                if (e["ts"].is_string())
+                                    lastOkxTsMs = std::stoll(e["ts"].get<std::string>());
+                                else if (e["ts"].is_number())
+                                    lastOkxTsMs = e["ts"].get<int64_t>();
+                                lastOkxRecvMs = nowMs();
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
                         if (e.contains("asks")) {
                             for (auto &lvl : e["asks"]) {
                                 double p = std::stod(lvl[0].get<std::string>());
@@ -182,16 +261,45 @@ int main(int argc, char *argv[])
 
     while (keepRunning.load()) {
         auto t0 = std::chrono::steady_clock::now();
+        int64_t loopTs = nowMs();
 
         double vwap = book.simulateMarketBuy(notionalUsd);
         double bestAsk = book.getBestAsk();
         double bestBid = book.getBestBid();
         double spread = book.getSpread();
         double depth5 = book.getDepthTopAsks(5);
+        double depth5Bid = book.getDepthTopBids(5);
         double mid = (bestAsk + bestBid) / 2.0;
+        double imbalance = (depth5 + depth5Bid) > 0.0 ? (depth5Bid - depth5) / (depth5 + depth5Bid) : 0.0;
+
+        double tickLatencyMs = -1.0;
+        auto lastTs = lastOkxTsMs.load();
+        if (lastTs > 0)
+            tickLatencyMs = static_cast<double>(loopTs - lastTs);
+        int dropsInWindow = 0;
+        auto lastRecv = lastOkxRecvMs.load();
+        if (lastRecv > 0 && (loopTs - lastRecv) > intervalSec * 2000)
+            dropsInWindow = 1;
 
         if (std::isnan(vwap) || std::isnan(bestAsk) || std::isnan(bestBid)) {
             spdlog::warn("Not enough depth for ${}", notionalUsd);
+
+            json tick = {
+                {"type", "tick"},
+                {"status", "insufficient_depth"},
+                {"ts", loopTs},
+                {"symbol", symbol},
+                {"notional", notionalUsd},
+                {"taker_bps", takerBps},
+                {"spread", spread},
+                {"best_bid", bestBid},
+                {"best_ask", bestAsk},
+                {"depth_top5", depth5},
+                {"depth_top5_bids", depth5Bid},
+                {"drops_in_window", dropsInWindow},
+                {"imbalance", imbalance}};
+            if (tickLatencyMs >= 0.0) tick["tick_latency_ms"] = tickLatencyMs;
+            streamServer.broadcast(tick.dump());
         } else {
             double slip_vwap = (vwap - mid) / mid * 100.0;
             double slip_mod_pct = intercept + w_spread * spread + w_depth * depth5;
@@ -199,14 +307,41 @@ int main(int argc, char *argv[])
             double fee_usd = notionalUsd * (takerBps / 10000.0);
             double ac_cost = almgrenChrissImpact(notionalUsd, dailyVolUsd, sigma, lambda);
             double net_ac = slip_mod_usd + fee_usd + ac_cost;
+            double takerProb = (!std::isnan(spread) && !std::isnan(depth5))
+                                   ? mt_model.predict(spread, depth5)
+                                   : std::numeric_limits<double>::quiet_NaN();
 
             spdlog::info("Sim ▶ VWAP-slip={:.6f}% , Model-slip={:.6f}% (${:.6f}), Fee=${:.2f}, AC Impact=${:.2f}, Net(AC)=${:.2f}",
                          slip_vwap, slip_mod_pct, slip_mod_usd, fee_usd, ac_cost, net_ac);
 
             if (!std::isnan(spread) && !std::isnan(depth5)) {
-                double takerProb = mt_model.predict(spread, depth5);
                 spdlog::info("Maker/Taker ▶ Taker Probability = {:.2f}%", takerProb * 100.0);
             }
+
+            json tick = {
+                {"type", "tick"},
+                {"status", "ok"},
+                {"ts", loopTs},
+                {"symbol", symbol},
+                {"notional", notionalUsd},
+                {"taker_bps", takerBps},
+                {"spread", spread},
+                {"best_bid", bestBid},
+                {"best_ask", bestAsk},
+                {"mid", mid},
+                {"depth_top5", depth5},
+                {"depth_top5_bids", depth5Bid},
+                {"vwap_slip_pct", slip_vwap},
+                {"model_slip_pct", slip_mod_pct},
+                {"model_slip_usd", slip_mod_usd},
+                {"fee_usd", fee_usd},
+                {"ac_impact_usd", ac_cost},
+                {"net_cost_usd", net_ac},
+                {"drops_in_window", dropsInWindow},
+                {"imbalance", imbalance}};
+            if (!std::isnan(takerProb)) tick["taker_prob_pct"] = takerProb * 100.0;
+            if (tickLatencyMs >= 0.0) tick["tick_latency_ms"] = tickLatencyMs;
+            streamServer.broadcast(tick.dump());
         }
 
         auto t1 = std::chrono::steady_clock::now();
@@ -218,6 +353,7 @@ int main(int argc, char *argv[])
     }
 
     ws.stop();
+    streamServer.stop();
     ix::uninitNetSystem();
     spdlog::info("Shutdown complete.");
     return 0;

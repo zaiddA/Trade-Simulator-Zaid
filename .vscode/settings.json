@@ -3,5 +3,6 @@
   "files.associations": {
     "*.ejs": "html",
     "mutex": "cpp"
-  }
+  },
+  "cmake.ignoreCMakeListsMissing": true
 }

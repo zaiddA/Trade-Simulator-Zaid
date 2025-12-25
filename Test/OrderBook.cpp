@@ -92,3 +92,15 @@ double OrderBook::getDepthTopAsks(int levels) const
     }
     return sum;
 }
+
+double OrderBook::getDepthTopBids(int levels) const
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    double sum = 0.0;
+    int count = 0;
+    for (auto it = bids.begin(); it != bids.end() && count < levels; ++it, ++count)
+    {
+        sum += it->second;
+    }
+    return sum;
+}

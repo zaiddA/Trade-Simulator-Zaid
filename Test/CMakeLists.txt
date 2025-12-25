@@ -5,9 +5,11 @@ project(GoQuantSim LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 2) Use vcpkg’s toolchain
-set(CMAKE_TOOLCHAIN_FILE "C:/dev/vcpkg/scripts/buildsystems/vcpkg.cmake"
-    CACHE STRING "Vcpkg toolchain file")
+# 2) Use vcpkg’s toolchain if provided
+if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        CACHE STRING "Vcpkg toolchain file")
+endif()
 
 # 3) Find all necessary packages
 find_package(ixwebsocket    CONFIG REQUIRED)
@@ -44,4 +46,3 @@ target_link_libraries(simulator
 enable_testing()
 # 6) Unit tests
 add_subdirectory(tests)
-

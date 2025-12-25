@@ -19,6 +19,7 @@ public:
     double getBestBid() const;
     double getSpread() const;
     double getDepthTopAsks(int levels = 5) const;
+    double getDepthTopBids(int levels = 5) const;
 
 private:
     std::map<double, double, std::less<>> asks;

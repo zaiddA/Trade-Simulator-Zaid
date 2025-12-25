@@ -45,4 +45,5 @@ TEST_CASE("Spread & depth getters", "[OrderBook]")
 
     REQUIRE(b.getSpread() == Approx(2.0).margin(1e-12));
     REQUIRE(b.getDepthTopAsks(5) == Approx(1.0).margin(1e-12));
+    REQUIRE(b.getDepthTopBids(5) == Approx(1.0).margin(1e-12));
 }
