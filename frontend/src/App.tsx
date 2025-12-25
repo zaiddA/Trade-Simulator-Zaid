@@ -168,7 +168,9 @@ export default function App() {
               />
               <YAxis stroke="#6b7280" fontSize={12} />
               <Tooltip
-                formatter={(value: number) => `$${value.toFixed(2)}`}
+                formatter={(value: number | string | undefined) =>
+                  `$${Number(value ?? 0).toFixed(2)}`
+                }
                 labelFormatter={(v) => fmtTime(Number(v))}
               />
               <Area
@@ -197,7 +199,9 @@ export default function App() {
               />
               <YAxis stroke="#6b7280" fontSize={12} />
               <Tooltip
-                formatter={(value: number) => `${value.toFixed(4)}%`}
+                formatter={(value: number | string | undefined) =>
+                  `${Number(value ?? 0).toFixed(4)}%`
+                }
                 labelFormatter={(v) => fmtTime(Number(v))}
               />
               <Line type="monotone" dataKey="vwap" stroke="#f43f5e" dot={false} />
